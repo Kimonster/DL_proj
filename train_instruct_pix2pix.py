@@ -52,6 +52,33 @@ from diffusers.utils import check_min_version, deprecate, is_wandb_available
 from diffusers.utils.constants import DIFFUSERS_REQUEST_TIMEOUT
 from diffusers.utils.import_utils import is_xformers_available
 from diffusers.utils.torch_utils import is_compiled_module
+import json
+import pandas as pd
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+from skimage.metrics import peak_signal_noise_ratio as compare_psnr
+from skimage.metrics import structural_similarity as compare_ssim
+
+
+class LoRAAdapter(torch.nn.Module):
+    """A small LoRA-like adapter implemented as a bottleneck 1x1 conv.
+
+    This serves as a lightweight trainable adapter for UNet image conditioning.
+    It is intentionally small (low-rank) and mimics the intent of LoRA.
+    """
+
+    def __init__(self, channels, rank=4):
+        super().__init__()
+        mid = max(1, rank)
+        self.adapter = torch.nn.Sequential(
+            torch.nn.Conv2d(channels, mid, kernel_size=1),
+            torch.nn.ReLU(inplace=True),
+            torch.nn.Conv2d(mid, channels, kernel_size=1),
+        )
+
+    def forward(self, x):
+        return self.adapter(x)
 
 
 if is_wandb_available():
@@ -132,6 +159,29 @@ def parse_args():
         default=None,
         help="Variant of the model files of the pretrained model identifier from huggingface.co/models, 'e.g.' fp16",
     )
+    parser.add_argument(
+            "--metadata_filename",
+            type=str,
+            default="metadata.jsonl",
+            help="If present inside --train_data_dir, this JSONL will be used as the dataset (fields: input_image, edited_image, edit_prompt).",
+        )
+    parser.add_argument(
+            "--use_lora",
+            action="store_true",
+            help="Use a small LoRA-like adapter on the UNet conditioning instead of full fine-tuning.",
+        )
+    parser.add_argument(
+            "--lora_rank",
+            type=int,
+            default=4,
+            help="Hidden rank for the LoRA-like adapter bottleneck.",
+        )
+    parser.add_argument(
+            "--metrics_csv",
+            type=str,
+            default="metrics.csv",
+            help="CSV filename inside --output_dir to append training/validation metrics (PSNR/SSIM/loss).",
+        )
     parser.add_argument(
         "--dataset_name",
         type=str,
@@ -482,6 +532,13 @@ def main():
         if args.output_dir is not None:
             os.makedirs(args.output_dir, exist_ok=True)
 
+        # Save the args config for later reference / README generation
+        try:
+            with open(os.path.join(args.output_dir, "config.json"), "w", encoding="utf-8") as cf:
+                json.dump(vars(args), cf, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+
         if args.push_to_hub:
             repo_id = create_repo(
                 repo_id=args.hub_model_id or Path(args.output_dir).name, exist_ok=True, token=args.hub_token
@@ -519,6 +576,16 @@ def main():
         new_conv_in.weight.zero_()
         new_conv_in.weight[:, :4, :, :].copy_(unet.conv_in.weight)
         unet.conv_in = new_conv_in
+
+    # If requested, attach a small LoRA-like adapter to the UNet for lightweight fine-tuning.
+    if args.use_lora:
+        logger.info(f"Attaching LoRA-like adapter with rank={args.lora_rank} to UNet")
+        unet.lora_adapter = LoRAAdapter(out_channels, rank=args.lora_rank)
+        # Freeze base UNet parameters and keep adapter trainable
+        for param in unet.parameters():
+            param.requires_grad = False
+        for param in unet.lora_adapter.parameters():
+            param.requires_grad = True
 
     # Freeze vae and text_encoder
     vae.requires_grad_(False)
@@ -608,8 +675,12 @@ def main():
     else:
         optimizer_cls = torch.optim.AdamW
 
+    trainable_params = [p for p in unet.parameters() if p.requires_grad]
+    if len(trainable_params) == 0:
+        # Fallback to unet.parameters() if nothing was marked trainable
+        trainable_params = unet.parameters()
     optimizer = optimizer_cls(
-        unet.parameters(),
+        trainable_params,
         lr=args.learning_rate,
         betas=(args.adam_beta1, args.adam_beta2),
         weight_decay=args.adam_weight_decay,
@@ -629,16 +700,26 @@ def main():
             cache_dir=args.cache_dir,
         )
     else:
-        data_files = {}
-        if args.train_data_dir is not None:
+        # If the train_data_dir contains a metadata jsonl with records mapping
+        # input_image, edited_image and edit_prompt, use it. Otherwise fall back
+        # to imagefolder (legacy behavior).
+        if args.train_data_dir is None:
+            raise ValueError("--train_data_dir must be set when --dataset_name is not provided")
+
+        metadata_path = os.path.join(args.train_data_dir, args.metadata_filename)
+        if os.path.exists(metadata_path):
+            # Load a JSONL dataset where each line has: input_image, edited_image, edit_prompt
+            dataset = load_dataset("json", data_files={"train": metadata_path}, cache_dir=args.cache_dir)
+        else:
+            data_files = {}
             data_files["train"] = os.path.join(args.train_data_dir, "**")
-        dataset = load_dataset(
-            "imagefolder",
-            data_files=data_files,
-            cache_dir=args.cache_dir,
-        )
-        # See more about loading custom images at
-        # https://huggingface.co/docs/datasets/main/en/image_load#imagefolder
+            dataset = load_dataset(
+                "imagefolder",
+                data_files=data_files,
+                cache_dir=args.cache_dir,
+            )
+            # See more about loading custom images at
+            # https://huggingface.co/docs/datasets/main/en/image_load#imagefolder
 
     # Preprocessing the datasets.
     # We need to tokenize inputs and targets.
@@ -688,12 +769,35 @@ def main():
     )
 
     def preprocess_images(examples):
+        def load_if_path(x):
+            # examples may provide PIL.Image objects (from imagefolder) or string paths (from json)
+            if isinstance(x, str):
+                img = PIL.Image.open(x)
+                img = PIL.ImageOps.exif_transpose(img)
+                return img
+            # Some datasets may store as dict with 'path' or 'image' keys
+            if isinstance(x, dict):
+                # dataset imagefolder sometimes returns {'path':..., 'bytes':...} or similar
+                if "path" in x:
+                    img = PIL.Image.open(x["path"]) 
+                    img = PIL.ImageOps.exif_transpose(img)
+                    return img
+                if "image" in x and isinstance(x["image"], str):
+                    img = PIL.Image.open(x["image"]) 
+                    img = PIL.ImageOps.exif_transpose(img)
+                    return img
+                if "image" in x and hasattr(x["image"], "convert"):
+                    return x["image"]
+            # Otherwise assume it's already an image-like object
+            return x
+
         original_images = np.concatenate(
-            [convert_to_np(image, args.resolution) for image in examples[original_image_column]]
+            [convert_to_np(load_if_path(image), args.resolution) for image in examples[original_image_column]]
         )
         edited_images = np.concatenate(
-            [convert_to_np(image, args.resolution) for image in examples[edited_image_column]]
+            [convert_to_np(load_if_path(image), args.resolution) for image in examples[edited_image_column]]
         )
+
         # We need to ensure that the original and the edited images undergo the same
         # augmentation transforms.
         images = np.stack([original_images, edited_images])
@@ -881,6 +985,10 @@ def main():
                 # Instead of getting a diagonal Gaussian here, we simply take the mode.
                 original_image_embeds = vae.encode(batch["original_pixel_values"].to(weight_dtype)).latent_dist.mode()
 
+                # If using the LoRA-like adapter, pass the original image embedding through it
+                if args.use_lora and hasattr(unet, "lora_adapter"):
+                    original_image_embeds = original_image_embeds + unet.lora_adapter(original_image_embeds)
+
                 # Conditioning dropout to support classifier-free guidance during inference. For more details
                 # check out the section 3.2.1 of the original paper https://huggingface.co/papers/2211.09800.
                 if args.conditioning_dropout_prob is not None:
@@ -963,6 +1071,77 @@ def main():
                         save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
                         accelerator.save_state(save_path)
                         logger.info(f"Saved state to {save_path}")
+                        # Compute quick PSNR/SSIM metrics on a few samples from the current batch
+                        try:
+                            pipeline = StableDiffusionInstructPix2PixPipeline.from_pretrained(
+                                args.pretrained_model_name_or_path,
+                                unet=unwrap_model(unet),
+                                text_encoder=unwrap_model(text_encoder),
+                                vae=unwrap_model(vae),
+                                revision=args.revision,
+                                variant=args.variant,
+                                torch_dtype=weight_dtype,
+                            )
+
+                            n_eval = min(4, batch["original_pixel_values"].shape[0])
+                            metrics = []
+                            for i in range(n_eval):
+                                prompt = tokenizer.decode(batch["input_ids"][i].cpu().numpy(), skip_special_tokens=True)
+                                orig = batch["original_pixel_values"][i].detach().cpu()
+                                targ = batch["edited_pixel_values"][i].detach().cpu()
+                                # Convert tensors in [-1,1] to uint8 images
+                                def to_image(t):
+                                    arr = ((t + 1.0) / 2.0 * 255).permute(1, 2, 0).numpy().astype("uint8")
+                                    return PIL.Image.fromarray(arr)
+
+                                orig_pil = to_image(orig)
+                                targ_pil = to_image(targ)
+
+                                pred = pipeline(
+                                    prompt,
+                                    image=orig_pil,
+                                    num_inference_steps=20,
+                                    image_guidance_scale=1.5,
+                                    guidance_scale=7,
+                                ).images[0]
+
+                                pred_np = np.array(pred).astype("uint8")
+                                targ_np = np.array(targ_pil).astype("uint8")
+
+                                psnr = float(compare_psnr(targ_np, pred_np, data_range=255))
+                                try:
+                                    ssim = float(compare_ssim(targ_np, pred_np, multichannel=True))
+                                except Exception:
+                                    ssim = float(compare_ssim(targ_np[..., 0], pred_np[..., 0]))
+
+                                metrics.append({"step": global_step, "epoch": epoch, "psnr": psnr, "ssim": ssim})
+
+                            # Append metrics to CSV
+                            metrics_csv_path = os.path.join(args.output_dir, args.metrics_csv)
+                            df = pd.DataFrame(metrics)
+                            if not os.path.exists(metrics_csv_path):
+                                df.to_csv(metrics_csv_path, index=False)
+                            else:
+                                df.to_csv(metrics_csv_path, mode="a", header=False, index=False)
+
+                            # Also save a quick plot
+                            try:
+                                df_plot = pd.read_csv(metrics_csv_path)
+                                plt.figure()
+                                plt.plot(df_plot["step"], df_plot["psnr"], label="PSNR")
+                                plt.plot(df_plot["step"], df_plot["ssim"], label="SSIM")
+                                plt.xlabel("step")
+                                plt.legend()
+                                plt.tight_layout()
+                                plt.savefig(os.path.join(args.output_dir, "metrics_plot.png"))
+                                plt.close()
+                            except Exception:
+                                pass
+
+                            del pipeline
+                            torch.cuda.empty_cache()
+                        except Exception as e:
+                            logger.warning(f"Metric evaluation failed: {e}")
 
             logs = {"step_loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
             progress_bar.set_postfix(**logs)

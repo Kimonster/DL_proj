@@ -1,0 +1,11 @@
+torch
+accelerate
+transformers
+diffusers
+datasets
+huggingface_hub
+pandas
+matplotlib
+scikit-image
+Pillow
+opencv-python
